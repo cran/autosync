@@ -1,0 +1,287 @@
+# Automerge sync server implementation using nanonext
+
+#' Create an Automerge sync server
+#'
+#' Creates a WebSocket server that implements the automerge-repo sync protocol,
+#' compatible with JavaScript, Rust, and other Automerge clients.
+#'
+#' @param port Port to listen on. Default 0 (binds to a random available port).
+#'   The actual URL is retrieved via `server$url`.
+#' @param host Host address to bind to. Default "127.0.0.1" (localhost).
+#' @param data_dir Directory for document storage. Defaults to a
+#'   session-temporary directory, so documents do not persist across R
+#'   sessions. Supply an explicit path to persist documents across sessions.
+#' @param auto_create_docs Logical, whether to auto-create documents when
+#'   clients request unknown document IDs. Default TRUE.
+#' @param storage_id Optional storage ID for this server. If NULL (default),
+#'   generates a new persistent identity. Set to NA for an ephemeral server
+#'   (no persistence identity).
+#' @param tls (optional) for secure wss:// connections, a TLS configuration
+#'   object created by [nanonext::tls_config()].
+#' @param auth Optional authentication configuration created by [auth_config()].
+#'   When provided, clients must include a valid JWT (ID token) as a
+#'   Bearer token in the Authorization header of the WebSocket upgrade request.
+#'   Connections without valid credentials are rejected immediately.
+#'   Note: TLS is required when authentication is enabled to protect tokens.
+#' @param share Controls document sharing policy for connected clients. This
+#'   unified parameter governs both proactive document announcement (pushing
+#'   documents to clients) and access control (allowing clients to request
+#'   documents). Accepts one of:
+#'   \itemize{
+#'     \item `NA` (default) — never announce but allow all requests.
+#'     \item `TRUE` — announce all documents to all clients and allow all
+#'       requests.
+#'     \item `FALSE` — never announce and deny all requests (sends
+#'       `doc-unavailable`).
+#'     \item A function with signature `function(client_id, doc_id)`
+#'       returning `TRUE` (announce and allow), `NA` (allow on request only),
+#'       or `FALSE` (deny access). Called per client and per document.
+#'   }
+#'
+#' @return An autosync_server object inheriting from 'nanoServer', with
+#'   `$start()` and `$close()` methods.
+#'
+#' @details
+#' The returned server inherits from nanonext's nanoServer class and provides
+#' `$start()` and `$close()` methods for non-blocking operation.
+#'
+#' @examplesIf interactive()
+#' # Create and start a server
+#' server <- sync_server()
+#' server$start()
+#'
+#' # Server is now running in the background
+#' # ...do other work...
+#'
+#' # Stop when done
+#' server$close()
+#'
+#' # With TLS for secure connections
+#' cert <- nanonext::write_cert()
+#' tls <- nanonext::tls_config(server = cert$server)
+#' server <- sync_server(tls = tls)
+#' server$start()
+#' server$url
+#' server$close()
+#'
+#' # Server with OIDC authentication (requires TLS)
+#' cert <- nanonext::write_cert()
+#' tls <- nanonext::tls_config(server = cert$server)
+#' server <- sync_server(
+#'   tls = tls,
+#'   auth = auth_config(
+#'     client_id = "123456789.apps.googleusercontent.com",
+#'     allowed_domains = "mycompany.com"
+#'   )
+#' )
+#'
+#' @export
+sync_server <- function(
+  port = 0L,
+  host = "127.0.0.1",
+  data_dir = tempfile("autosync"),
+  auto_create_docs = TRUE,
+  storage_id = NULL,
+  tls = NULL,
+  auth = NULL,
+  share = NA
+) {
+  port <- as.integer(port)
+
+  # Enforce TLS when authentication is enabled
+  if (!is.null(auth) && is.null(tls)) {
+    stop(
+      "Authentication requires TLS. Provide a 'tls' configuration.\n",
+      "Transmitting tokens over unencrypted connections is a security risk."
+    )
+  }
+
+  scheme <- if (is.null(tls)) "ws" else "wss"
+  url <- sprintf("%s://%s:%d", scheme, host, port)
+
+  documents <- new.env(hash = TRUE, parent = emptyenv())
+  sync_states <- new.env(hash = TRUE, parent = emptyenv())
+  connections <- new.env(hash = TRUE, parent = emptyenv())
+  doc_peers <- new.env(hash = TRUE, parent = emptyenv())
+
+  if (!dir.exists(data_dir)) {
+    dir.create(data_dir, recursive = TRUE)
+  }
+
+  # Create state environment for handlers to access via closure
+
+  state <- new.env(hash = TRUE, parent = emptyenv())
+  state$host <- host
+  state$data_dir <- data_dir
+  state$auto_create_docs <- auto_create_docs
+  state$peer_id <- generate_peer_id()
+  state$storage_id <- if (is.null(storage_id)) {
+    generate_peer_id()
+  } else if (is.na(storage_id)) {
+    NULL
+  } else {
+    storage_id
+  }
+  state$documents <- documents
+  state$sync_states <- sync_states
+  state$connections <- connections
+  state$doc_peers <- doc_peers
+  state$ephemeral_counts <- new.env(hash = TRUE, parent = emptyenv())
+  state$auth <- auth
+  state$share <- share
+
+  load_all_documents(state)
+
+  on_open <- function(ws, req) {
+    ws_id <- as.character(ws$id)
+
+    # Authenticate from Authorization header if auth is enabled
+    if (!is.null(state$auth)) {
+      auth_result <- authenticate_header(state$auth, req$headers)
+      if (!auth_result$valid) {
+        ws$send(cborenc(list(
+          type = "error",
+          senderId = state$peer_id,
+          message = auth_result$error
+        )))
+        ws$close()
+        return(invisible())
+      }
+    }
+
+    state$connections[[ws_id]] <- list(
+      ws = ws,
+      client_id = NULL,
+      metadata = NULL,
+      connected_at = Sys.time(),
+      authenticated_email = if (!is.null(state$auth)) auth_result$email
+    )
+  }
+
+  on_message <- function(ws, data) {
+    ws_id <- as.character(ws$id)
+    conn <- state$connections[[ws_id]]
+    client_id <- if (!is.null(conn$client_id)) conn$client_id else ws_id
+    handle_message(state, client_id, ws_id, data)
+  }
+
+  on_close <- function(ws) {
+    ws_id <- as.character(ws$id)
+    conn <- state$connections[[ws_id]]
+    if (!is.null(conn)) {
+      client_id <- conn$client_id
+      handle_disconnect(state, client_id)
+      rm(list = ws_id, envir = state$connections)
+      if (!is.null(client_id) && exists(client_id, envir = state$connections)) {
+        rm(list = client_id, envir = state$connections)
+      }
+    }
+  }
+
+  ws_handler <- handler_ws(
+    path = "/",
+    on_message = on_message,
+    on_open = on_open,
+    on_close = on_close,
+    textframes = FALSE
+  )
+
+  server <- http_server(
+    url = url,
+    handlers = list(ws_handler),
+    tls = tls
+  )
+
+  attr(server, "sync") <- state
+  class(server) <- c("autosync_server", class(server))
+
+  server
+}
+
+#' Get a document from the server
+#'
+#' Retrieves an Automerge document by its ID.
+#'
+#' @param server An autosync_server object.
+#' @param doc_id Document ID string.
+#'
+#' @return Automerge document object, or NULL if not found.
+#'
+#' @examplesIf interactive()
+#' server <- sync_server()
+#' doc_id <- create_document(server)
+#' get_document(server, doc_id)
+#' server$close()
+#'
+#' @export
+get_document <- function(server, doc_id) {
+  attr(server, "sync")$documents[[doc_id]]
+}
+
+#' List all document IDs
+#'
+#' Returns the IDs of all documents currently loaded in the server.
+#'
+#' @param server An autosync_server object.
+#'
+#' @return Character vector of document IDs.
+#'
+#' @examplesIf interactive()
+#' server <- sync_server()
+#' create_document(server)
+#' list_documents(server)
+#' server$close()
+#'
+#' @export
+list_documents <- function(server) {
+  ls(attr(server, "sync")$documents)
+}
+
+#' Create a new document on the server
+#'
+#' Creates a new empty Automerge document and registers it with the server.
+#'
+#' @param server An autosync_server object.
+#' @param doc_id Optional document ID. If NULL, generates a new ID.
+#'
+#' @return Document ID string.
+#'
+#' @examplesIf interactive()
+#' server <- sync_server()
+#' doc_id <- create_document(server)
+#' server$close()
+#'
+#' @export
+create_document <- function(server, doc_id = NULL) {
+  state <- attr(server, "sync")
+
+  if (is.null(doc_id)) {
+    doc_id <- generate_document_id()
+  }
+
+  doc <- am_create()
+  state$documents[[doc_id]] <- doc
+  save_document(state, doc_id, doc)
+  announce_new_document(state, doc_id, doc)
+
+  doc_id
+}
+
+#' Print method for autosync_server
+#'
+#' @param x An autosync_server object.
+#' @param ... Ignored.
+#'
+#' @return Invisibly returns x.
+#'
+#' @keywords internal
+#' @export
+print.autosync_server <- function(x, ...) {
+  state <- attr(x, "sync")
+  cat("Automerge Sync Server\n")
+  cat("  URL:", x$url, "\n")
+  cat("  Data dir:", state$data_dir, "\n")
+  cat("  Documents:", length(state$documents), "\n")
+  cat("  Connections:", length(state$connections), "\n")
+  NextMethod()
+}
